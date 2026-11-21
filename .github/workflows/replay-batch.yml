@@ -1,12 +1,19 @@
 name: replay-batch
-# Builds SEVERAL already-claimed, already-granted targets of rohanarun/alpoge-rh-replay in one job:
-# one toolchain + Mathlib setup, then one build and one receipt per target.
-# Untested draft. Runs untrusted Lean code: keep this repo free of secrets.
+# Builds SEVERAL already-claimed, already-granted targets of rohanarun/alpoge-rh-replay in one job,
+# then publishes ONE release per claim (tag replay-<ID>-issue-<NUMBER>) with the receipt, build log and
+# checksums, downloads every asset back and compares digests, and writes the "Replay submission" text.
+# Follows "Check a submission before posting" in the replay's CONTRIBUTING.md. Posting stays manual.
+# Untested draft: dispatch it once with ONE freshly granted target before relying on it.
+# The build job runs untrusted Lean code and has read-only permissions; only the publish job can write,
+# and it never runs the replay's code.
 on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "Space-separated granted IDs, e.g. M162132 M162273 M162285"
+        description: "Space-separated granted IDs, e.g. M162132 M162273"
+        required: true
+      issues:
+        description: "Claim issue number for each target, e.g. M162132=9061 M162273=9126"
         required: true
 permissions:
   contents: read
@@ -16,11 +23,14 @@ jobs:
     timeout-minutes: 350
     env:
       TARGETS: ${{ inputs.targets }}
+      ISSUES: ${{ inputs.issues }}
     steps:
-      - name: Validate target IDs
+      - name: Validate inputs
         run: |
+          set -euo pipefail
           for t in $TARGETS; do
             [[ "$t" =~ ^[PM][0-9]{1,7}$ ]] || { echo "Bad target id: $t"; exit 1; }
+            grep -Eq "(^| )$t=[0-9]+( |$)" <<<"$ISSUES" || { echo "No issue number for $t in 'issues'"; exit 1; }
           done
           echo "Targets: $TARGETS"
       - uses: actions/checkout@v4
@@ -49,8 +59,79 @@ jobs:
           done
           { echo "| Target | Result | Time |"; echo "|---|---|---|"; cat "$RUNNER_TEMP/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
           [ -z "$failed" ] || { echo "Failed:$failed"; exit 1; }
+      - name: Verify each receipt with the replay's own checker
+        run: |
+          set -euo pipefail
+          for t in $TARGETS; do
+            python3 tracker/replay_evidence.py verify "$t" "$RUNNER_TEMP/receipts/$t" --checkout "$RUNNER_TEMP/vol/lean"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: receipts
           path: ${{ runner.temp }}/receipts
+
+  publish:
+    needs: replay
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TARGETS: ${{ inputs.targets }}
+      ISSUES: ${{ inputs.issues }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: receipts
+          path: receipts
+      - name: Publish one release per claim and check every link
+        run: |
+          set -euo pipefail
+          declare -A ISSUE
+          for kv in $ISSUES; do ISSUE[${kv%%=*}]=${kv##*=}; done
+          mkdir -p submit
+          for t in $TARGETS; do
+            n=${ISSUE[$t]:?no issue number for $t}
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::bad issue number for $t"; exit 1; }
+            d="receipts/$t"; [ -d "$d" ] || { echo "::error::no receipt directory for $t"; exit 1; }
+            rj=$(find "$d" -name receipt.json | head -n1); [ -n "$rj" ] || { echo "::error::no receipt.json for $t"; exit 1; }
+            dir=$(dirname "$rj")
+            log=$(find "$d" -name build.log | head -n1); [ -n "$log" ] || { echo "::error::no build.log for $t"; exit 1; }
+            want=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('log_sha256',''))" "$rj")
+            have=$(sha256sum "$log" | cut -d' ' -f1)
+            [ "$want" = "$have" ] || { echo "::error::$t: receipt log_sha256 does not match build.log"; exit 1; }
+            grep -Eq 'Built|Replayed' "$log" || { echo "::error::$t: build.log has no Built/Replayed line"; exit 1; }
+            if grep -nE '/Users/|/home/[^r]' "$log" | head -n3 | grep -q .; then echo "::warning::$t: build.log may contain a personal path; review before posting"; fi
+            tar -C receipts -czf "$t-receipt-dir.tar.gz" "$t"
+            files=("$rj" "$log" "$t-receipt-dir.tar.gz")
+            [ -f "$dir/kernel-replay.json" ] && files+=("$dir/kernel-replay.json")
+            [ -f "$dir/targets.tar.gz" ] && files+=("$dir/targets.tar.gz")
+            tag="replay-$t-issue-$n"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" \
+              --notes "Receipt, build log and checksums for claim $t (issue $n, rohanarun/alpoge-rh-replay). Same-kernel replay, not an independent verification." \
+              "${files[@]}"
+            out="submit/$t.md"
+            { echo "Replay submission"; echo "Task: $t"; echo "Claim: https://github.com/rohanarun/alpoge-rh-replay/issues/$n"
+              echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+              python3 - "$rj" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          for k in ("exit_status", "elapsed_seconds", "started_utc", "finished_utc", "rebuilt_project_modules", "bundle_sha256", "log_sha256"):
+              if k in r: print(f"{k}: {r[k]}")
+          PY
+              echo "Assets (release $tag):"; } > "$out"
+            for f in "${files[@]}"; do
+              b=$(basename "$f"); url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$tag/$b"
+              curl -fL --retry 3 -o "$RUNNER_TEMP/dl" "$url" || { echo "::error::$url does not download"; exit 1; }
+              a=$(sha256sum "$f" | cut -d' ' -f1); c=$(sha256sum "$RUNNER_TEMP/dl" | cut -d' ' -f1)
+              [ "$a" = "$c" ] || { echo "::error::$url digest differs from the uploaded file"; exit 1; }
+              echo "- $url  sha256 $a" >> "$out"
+            done
+            echo "Note: Same-kernel replay, not an independent verification. Run by Pablo Nogueira Grossi (G6 LLC), prepared with assistance from Claude." >> "$out"
+            cat "$out" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: submission-drafts
+          path: submit
