@@ -1,0 +1,34 @@
+name: replay-packet
+# Builds ONE already-claimed packet of rohanarun/alpoge-rh-replay and uploads the receipt.
+# Untested draft. Runs untrusted Lean code: keep this repo free of secrets and Pages.
+on:
+  workflow_dispatch:
+    inputs:
+      packet:
+        description: "Claimed packet ID, e.g. P0123"
+        required: true
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest   # x86_64; the replay's verify.sh rejects other architectures
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rohanarun/alpoge-rh-replay
+          persist-credentials: false
+      - name: Free disk space (Mathlib cache is about 11 GB)
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android && df -h /
+      - name: Install elan
+        run: |
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Prepare replay volume (pinned Lean 4.33.1, Mathlib 0df444a360eaa60ab8c11dca51a86af692955474)
+        run: ./verify.sh "$RUNNER_TEMP/vol" --prepare-only
+      - name: Build the packet
+        run: python3 tracker/tasks.py build "${{ inputs.packet }}" "$RUNNER_TEMP/vol/lean" "$RUNNER_TEMP/receipt" --bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: receipt-${{ inputs.packet }}
+          path: ${{ runner.temp }}/receipt
