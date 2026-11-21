@@ -1,0 +1,108 @@
+name: checks
+# Reproduces the Lean compilation + axiom audit and the numerical checks quoted in index.html.
+# Lean/Mathlib are pinned by checks/lean/lean-toolchain, lakefile.lean and lake-manifest.json.
+# If the pinned environment cannot be reproduced the job FAILS; it never substitutes another revision.
+on:
+  push:
+    paths: ['checks/**', '.github/workflows/checks.yml']
+  pull_request:
+    paths: ['checks/**', '.github/workflows/checks.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: checks/lean
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan and the pinned toolchain
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Show pins
+        run: |
+          set -euo pipefail
+          cat lean-toolchain
+          python3 -c "import json;m=json.load(open('lake-manifest.json'));print([(p['name'],p['rev']) for p in m['packages'] if p['name']=='mathlib'])"
+      - name: Fetch pinned Mathlib and cache
+        run: |
+          set -euo pipefail
+          lake exe cache get 2>&1 | tee ../../lake-update.log
+          git diff --exit-code lake-manifest.json || { echo "::error::lake-manifest.json changed: pinned Mathlib revision not reproduced"; exit 1; }
+      - name: Build theorem file and audit file
+        run: |
+          set -euo pipefail
+          lake build S3Zeta S3Audit 2>&1 | tee ../../lean-build.log
+      - name: Axiom audit
+        run: |
+          set -euo pipefail
+          lake env lean S3Audit.lean > ../../axioms.log 2>&1 || { cat ../../axioms.log; echo "::error::audit file failed to elaborate"; exit 1; }
+          cat ../../axioms.log
+          for n in S3Zeta.spectral_zeta_eq S3Zeta.RH_iff_spectral; do
+            grep -q "'$n' depends on axioms" ../../axioms.log || { echo "::error::missing audit line for $n"; exit 1; }
+          done
+          grep -q "sorryAx" ../../axioms.log && { echo "::error::sorryAx present"; exit 1; } || true
+          python3 ../axiom_gate.py ../../axioms.log 2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lean-logs
+          path: |
+            lake-update.log
+            lean-build.log
+            axioms.log
+          if-no-files-found: warn
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: checks/requirements.txt
+      - run: pip install -r checks/requirements.txt
+      - name: Exact checks (identities, enumerations)
+        working-directory: checks
+        run: |
+          set -uo pipefail
+          mkdir -p ../logs
+          fail=0
+          run() { name=$1; shift; python3 "$name.py" > "../logs/$name.log" 2>&1; rc=$?; echo "rc=$rc" >> "../logs/$name.log"; tail -n 5 "../logs/$name.log"; [ $rc -eq 0 ] || { echo "::error::$name.py exited $rc"; fail=1; }; }
+          run bd
+          run lifts_check
+          python3 gate_py.py ../logs/bd.log "B=2g all n: True" || fail=1
+          python3 gate_py.py ../logs/lifts_check.log "twisted" "lens" "H3 four-square" || fail=1
+          exit $fail
+      - name: Numerical checks (finite ranges; do not decide RH)
+        working-directory: checks
+        run: |
+          set -uo pipefail
+          fail=0
+          run() { name=$1; shift; python3 "$name.py" > "../logs/$name.log" 2>&1; rc=$?; echo "rc=$rc" >> "../logs/$name.log"; tail -n 5 "../logs/$name.log"; [ $rc -eq 0 ] || { echo "::error::$name.py exited $rc"; fail=1; }; }
+          run attack
+          run margin
+          run nodal_check
+          run fig_spectral
+          python3 gate_py.py ../logs/attack.log "ROBIN n in" "ROBIN on" "LAGARIAS" "NICOLAS" || fail=1
+          python3 gate_py.py ../logs/margin.log "ROBIN margin" "NICOLAS" || fail=1
+          python3 gate_py.py ../logs/nodal_check.log "sign changes of F(t)" "common zeros" || fail=1
+          grep -q "sign changes of F(t)=E\*(i,1/2+it) on (0.5,40\]: 20 " ../logs/nodal_check.log || { echo "::error::nodal sign-change count is not 20"; fail=1; }
+          exit $fail
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-logs
+          path: |
+            logs/
+            checks/*.svg
+          if-no-files-found: warn
