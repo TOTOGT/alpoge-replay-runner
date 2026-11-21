@@ -1,0 +1,56 @@
+name: replay-batch
+# Builds SEVERAL already-claimed, already-granted targets of rohanarun/alpoge-rh-replay in one job:
+# one toolchain + Mathlib setup, then one build and one receipt per target.
+# Untested draft. Runs untrusted Lean code: keep this repo free of secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Space-separated granted IDs, e.g. M162132 M162273 M162285"
+        required: true
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: ubuntu-latest   # x86_64; the replay's verify.sh rejects other architectures
+    timeout-minutes: 350
+    env:
+      TARGETS: ${{ inputs.targets }}
+    steps:
+      - name: Validate target IDs
+        run: |
+          for t in $TARGETS; do
+            [[ "$t" =~ ^[PM][0-9]{1,7}$ ]] || { echo "Bad target id: $t"; exit 1; }
+          done
+          echo "Targets: $TARGETS"
+      - uses: actions/checkout@v4
+        with:
+          repository: rohanarun/alpoge-rh-replay
+          persist-credentials: false
+      - name: Free disk space (Mathlib cache is about 11 GB)
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android && df -h /
+      - name: Install elan
+        run: |
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Prepare replay volume (pinned Lean 4.33.1, Mathlib 0df444a360eaa60ab8c11dca51a86af692955474)
+        run: ./verify.sh "$RUNNER_TEMP/vol" --prepare-only
+      - name: Build each target
+        run: |
+          failed=""
+          for t in $TARGETS; do
+            start=$(date +%s)
+            if python3 tracker/tasks.py build "$t" "$RUNNER_TEMP/vol/lean" "$RUNNER_TEMP/receipts/$t" --bundle; then
+              status=ok
+            else
+              status=FAILED; failed="$failed $t"
+            fi
+            echo "| $t | $status | $(( $(date +%s) - start ))s |" >> "$RUNNER_TEMP/summary.md"
+          done
+          { echo "| Target | Result | Time |"; echo "|---|---|---|"; cat "$RUNNER_TEMP/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
+          [ -z "$failed" ] || { echo "Failed:$failed"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: receipts
+          path: ${{ runner.temp }}/receipts
